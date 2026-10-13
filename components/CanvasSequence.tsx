@@ -83,6 +83,9 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
 
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
     const cache = imageCacheRef.current;
 
     // Find requested image or closest loaded fallback
