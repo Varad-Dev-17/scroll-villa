@@ -5,7 +5,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 export interface CanvasSequenceProps {
   /** Total number of frames in the sequence (default: 960) */
   totalFrames?: number;
-  /** Initial frames to preload before hiding preloader (default: 150) */
+  /** Initial frames to preload before hiding preloader (default: 24 for instant <1s start) */
   initialFramesToLoad?: number;
   /** Function resolving frame index (1-based) to image URL */
   getFramePath?: (index: number) => string;
@@ -32,9 +32,11 @@ const defaultGetFramePath = (index: number) => {
   return `/frames/frame_${padded}.jpg`;
 };
 
+const CACHE_NAME = 'villa-sequence-v1';
+
 export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
   totalFrames = 960,
-  initialFramesToLoad = 150,
+  initialFramesToLoad = 24,
   getFramePath = defaultGetFramePath,
   currentFrame,
   progress,
@@ -48,12 +50,14 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Cache for loaded HTMLImageElements (keyed by 1-based index)
+  // In-memory cache for fast canvas draws
   const imageCacheRef = useRef<Map<number, HTMLImageElement>>(new Map());
-  // Set of frames currently being loaded or requested
-  const loadingQueueRef = useRef<Set<number>>(new Set());
+  // In-flight loading promises to prevent duplicate fetches
+  const pendingLoadsRef = useRef<Map<number, Promise<HTMLImageElement>>>(new Map());
+  // High-priority queue for frames right at the user's scroll position
+  const priorityQueueRef = useRef<number[]>([]);
 
-  // State for initial preloader
+  // State for initial preloader and loading metrics
   const [initialLoadedCount, setInitialLoadedCount] = useState<number>(0);
   const [totalLoadedCount, setTotalLoadedCount] = useState<number>(0);
   const [isInitialReady, setIsInitialReady] = useState<boolean>(false);
@@ -75,7 +79,7 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
     return 1;
   }, [currentFrame, progress, totalFrames]);
 
-  // Canvas drawing routine
+  // Canvas drawing routine with nearest-loaded-frame fallback
   const renderFrame = useCallback((frameIndex: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -90,8 +94,7 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
 
     // Find requested image or closest loaded fallback
     let img: HTMLImageElement | undefined = cache.get(frameIndex);
-    if (!img) {
-      // Find nearest loaded frame so canvas never flickers blank
+    if (!img || !img.complete || img.naturalWidth === 0) {
       let closestDiff = Infinity;
       let closestFrame = -1;
       for (const [key, loadedImg] of cache.entries()) {
@@ -115,7 +118,6 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
 
     if (cWidth === 0 || cHeight === 0 || iWidth === 0 || iHeight === 0) return;
 
-    // Image fit calculation (cover or contain)
     let drawWidth: number;
     let drawHeight: number;
     let dx: number;
@@ -187,7 +189,6 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
 
-      // Re-render immediately on resize
       const target = getTargetFrame();
       renderFrame(target);
     }
@@ -212,158 +213,221 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
     };
   }, [resizeCanvas]);
 
-  // Core frame loader
+  // Single Frame Loader with Memory Deduplication and Persistent Cache Warming
   const loadSingleFrame = useCallback((index: number): Promise<HTMLImageElement> => {
-    return new Promise((resolve, reject) => {
-      const existing = imageCacheRef.current.get(index);
-      if (existing && existing.complete && existing.naturalWidth > 0) {
-        resolve(existing);
-        return;
-      }
+    const existing = imageCacheRef.current.get(index);
+    if (existing && existing.complete && existing.naturalWidth > 0) {
+      return Promise.resolve(existing);
+    }
 
+    const pending = pendingLoadsRef.current.get(index);
+    if (pending) {
+      return pending;
+    }
+
+    const frameUrl = getFramePath(index);
+
+    const promise = new Promise<HTMLImageElement>((resolve, reject) => {
       const img = new Image();
       img.decoding = 'async';
 
       img.onload = () => {
         imageCacheRef.current.set(index, img);
-        loadingQueueRef.current.delete(index);
+        pendingLoadsRef.current.delete(index);
+
+        // Persistent disk cache warming: saves to window.caches so refreshes are 0ms
+        if (typeof window !== 'undefined' && 'caches' in window) {
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.match(frameUrl).then((match) => {
+              if (!match) {
+                fetch(frameUrl, { cache: 'force-cache' }).then((res) => {
+                  if (res.ok) cache.put(frameUrl, res);
+                }).catch(() => {});
+              }
+            });
+          }).catch(() => {});
+        }
+
         resolve(img);
       };
 
-      img.onerror = () => {
-        loadingQueueRef.current.delete(index);
-        reject(new Error(`Failed to load frame ${index}`));
+      img.onerror = (err) => {
+        pendingLoadsRef.current.delete(index);
+        reject(err);
       };
 
-      loadingQueueRef.current.add(index);
-      img.src = getFramePath(index);
+      img.src = frameUrl;
     });
+
+    pendingLoadsRef.current.set(index, promise);
+    return promise;
   }, [getFramePath]);
 
-  // Initial Preloading & Background Loading Orchestrator
+  // Progressive Multi-Pass Stride Orchestrator
   useEffect(() => {
     let isCancelled = false;
     const initialTarget = Math.min(initialFramesToLoad, totalFrames);
     let initialCount = 0;
     let totalCount = 0;
 
-    // Concurrency pool helper
-    const runWorkerPool = async (
-      indices: number[],
-      concurrency: number,
-      onFrameLoaded: (index: number) => void,
-      isBackground: boolean = false
-    ) => {
-      let currentIndex = 0;
+    // Helper to generate progressive stride passes
+    const buildProgressiveQueue = (): number[] => {
+      const added = new Set<number>();
+      const queue: number[] = [];
 
-      const worker = async () => {
-        while (currentIndex < indices.length) {
-          if (isCancelled) return;
-          const frameIdx = indices[currentIndex++];
-
-          try {
-            await loadSingleFrame(frameIdx);
-            if (isCancelled) return;
-            onFrameLoaded(frameIdx);
-
-            // If background task, add slight micro-yield to keep UI ultra responsive
-            if (isBackground && currentIndex % 4 === 0) {
-              await new Promise((resolve) => setTimeout(resolve, 8));
-            }
-          } catch {
-            // Soft ignore frame error; will fallback to adjacent frames
-          }
+      const addIndex = (idx: number) => {
+        if (idx >= 1 && idx <= totalFrames && !added.has(idx)) {
+          added.add(idx);
+          queue.push(idx);
         }
       };
 
-      const workers = Array.from({ length: Math.min(concurrency, indices.length) }, () => worker());
-      await Promise.all(workers);
+      // Pass 0: Initial batch (1 to initialTarget)
+      for (let i = 1; i <= initialTarget; i++) {
+        addIndex(i);
+      }
+
+      // Pass 1: Global Backbone (Stride 8) - covers 100% of website timeline in ~120 frames
+      for (let i = 1; i <= totalFrames; i += 8) {
+        addIndex(i);
+      }
+      addIndex(totalFrames); // ensure last frame is present
+
+      // Pass 2: Medium Detail (Stride 4)
+      for (let i = 5; i <= totalFrames; i += 8) {
+        addIndex(i);
+      }
+
+      // Pass 3: Fine Detail (Stride 2)
+      for (let i = 3; i <= totalFrames; i += 4) {
+        addIndex(i);
+      }
+
+      // Pass 4: Complete Sequence (Stride 1 - all remaining)
+      for (let i = 1; i <= totalFrames; i++) {
+        addIndex(i);
+      }
+
+      return queue;
     };
 
-    // Phase 1: Preload initial 150 frames with 6 parallel streams
-    const initialIndices: number[] = [];
-    for (let i = 1; i <= initialTarget; i++) {
-      initialIndices.push(i);
-    }
+    const fullQueue = buildProgressiveQueue();
+    let queuePointer = 0;
 
-    const startLoadingPipeline = async () => {
-      await runWorkerPool(initialIndices, 6, (idx) => {
+    const onFrameSuccess = (idx: number) => {
+      totalCount++;
+      setTotalLoadedCount(totalCount);
+
+      if (idx <= initialTarget) {
         initialCount++;
-        totalCount++;
         setInitialLoadedCount(initialCount);
-        setTotalLoadedCount(totalCount);
-        onProgressUpdate?.(initialCount, totalCount);
+        if (initialCount >= initialTarget && !isInitialReady) {
+          setIsInitialReady(true);
+          onInitialLoadComplete?.();
+          queueRender(getTargetFrame());
 
-        // Once frame 1 loads, render it right away
-        if (idx === 1 || renderedFrameRef.current === -1) {
-          queueRender(1);
+          setTimeout(() => {
+            if (!isCancelled) {
+              setIsPreloaderHidden(true);
+            }
+          }, 400);
         }
-      });
+      }
 
-      if (isCancelled) return;
+      onProgressUpdate?.(initialCount, totalCount);
 
-      // Initial preloader threshold reached!
-      setIsInitialReady(true);
-      onInitialLoadComplete?.();
-      queueRender(getTargetFrame());
-
-      // Preloader fade transition timeout (700ms)
-      setTimeout(() => {
-        if (!isCancelled) {
-          setIsPreloaderHidden(true);
-        }
-      }, 750);
-
-      // Phase 2: Background preload remaining frames (e.g. 151 to 960) without blocking UI
-      if (initialTarget < totalFrames) {
-        const remainingIndices: number[] = [];
-        for (let i = initialTarget + 1; i <= totalFrames; i++) {
-          remainingIndices.push(i);
-        }
-
-        // Run background worker pool with low concurrency (4)
-        runWorkerPool(
-          remainingIndices,
-          4,
-          () => {
-            totalCount++;
-            setTotalLoadedCount(totalCount);
-            onProgressUpdate?.(initialCount, totalCount);
-          },
-          true
-        );
+      // Render frame 1 immediately when ready
+      if (idx === 1 || renderedFrameRef.current === -1) {
+        queueRender(1);
       }
     };
 
-    startLoadingPipeline();
+    // Worker pool with dynamic priority scheduling
+    const CONCURRENCY = 8;
+    const worker = async () => {
+      while (!isCancelled) {
+        let frameIdx: number | undefined;
+
+        // 1. Give absolute priority to the user's active scrub window
+        if (priorityQueueRef.current.length > 0) {
+          frameIdx = priorityQueueRef.current.shift();
+        } else if (queuePointer < fullQueue.length) {
+          // 2. Otherwise take next progressive stride frame
+          frameIdx = fullQueue[queuePointer++];
+        } else {
+          // All frames queued and finished
+          break;
+        }
+
+        if (frameIdx === undefined) break;
+
+        // Skip if already in memory
+        if (imageCacheRef.current.has(frameIdx)) {
+          continue;
+        }
+
+        try {
+          await loadSingleFrame(frameIdx);
+          if (isCancelled) return;
+          onFrameSuccess(frameIdx);
+
+          // If this was a priority frame close to current scrub, render it now
+          const currentTgt = getTargetFrame();
+          if (Math.abs(currentTgt - frameIdx) <= 2) {
+            queueRender(currentTgt);
+          }
+        } catch {
+          // Soft ignore error; nearest-frame fallback will handle it
+        }
+      }
+    };
+
+    const workers = Array.from({ length: CONCURRENCY }, () => worker());
+    Promise.all(workers);
 
     return () => {
       isCancelled = true;
     };
   }, [initialFramesToLoad, totalFrames, loadSingleFrame, onInitialLoadComplete, onProgressUpdate, queueRender, getTargetFrame]);
 
-  // Priority On-Demand Frame Loader: if user jumps to an unloaded frame, prioritize it
+  // Active Scrub Priority: When user scrolls, immediately fetch surrounding frames
   useEffect(() => {
     const target = getTargetFrame();
-    if (!imageCacheRef.current.has(target) && !loadingQueueRef.current.has(target)) {
-      // Prioritize target frame and immediate neighbors
-      loadSingleFrame(target)
-        .then(() => {
-          queueRender(target);
-        })
-        .catch(() => {});
-      
-      // Also pre-fetch adjacent frames in direction of scrub
-      const next1 = Math.min(totalFrames, target + 1);
-      const prev1 = Math.max(1, target - 1);
-      if (!imageCacheRef.current.has(next1)) loadSingleFrame(next1).catch(() => {});
-      if (!imageCacheRef.current.has(prev1)) loadSingleFrame(prev1).catch(() => {});
+
+    // Priority window: target and next 12 frames, plus previous 4
+    const priorityIndices: number[] = [];
+    for (let offset = 0; offset <= 12; offset++) {
+      const nextIdx = target + offset;
+      if (nextIdx <= totalFrames && !imageCacheRef.current.has(nextIdx)) {
+        priorityIndices.push(nextIdx);
+      }
+    }
+    for (let offset = 1; offset <= 4; offset++) {
+      const prevIdx = target - offset;
+      if (prevIdx >= 1 && !imageCacheRef.current.has(prevIdx)) {
+        priorityIndices.push(prevIdx);
+      }
+    }
+
+    if (priorityIndices.length > 0) {
+      // Prepend to priority queue so workers pick them immediately
+      priorityQueueRef.current = [
+        ...priorityIndices,
+        ...priorityQueueRef.current.filter((id) => !priorityIndices.includes(id)),
+      ].slice(0, 30);
+
+      // Trigger immediate fetch of the exact target frame
+      if (!imageCacheRef.current.has(target)) {
+        loadSingleFrame(target)
+          .then(() => queueRender(target))
+          .catch(() => {});
+      }
     }
 
     queueRender(target);
   }, [currentFrame, progress, getTargetFrame, queueRender, loadSingleFrame, totalFrames]);
 
-  // Loading percentage calculation (0% to 100% of initial frames)
+  // Loading percentage calculation (0% to 100% of initial starter batch)
   const initialPercent = Math.min(
     100,
     Math.round((initialLoadedCount / Math.max(1, initialFramesToLoad)) * 100)
@@ -384,7 +448,7 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
       {/* Built-in Luxury Preloader */}
       {showPreloader && !isPreloaderHidden && (
         <div
-          className={`absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#070707] text-white transition-all duration-700 ease-out ${
+          className={`absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#070707] text-white transition-all duration-500 ease-out ${
             isInitialReady ? 'opacity-0 pointer-events-none scale-98' : 'opacity-100 scale-100'
           }`}
         >

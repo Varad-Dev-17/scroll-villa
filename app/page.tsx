@@ -11,7 +11,7 @@ export default function Home() {
   const [isInSequence, setIsInSequence] = useState<boolean>(true);
 
   const totalFrames = 960;
-  const initialFramesToLoad = 150;
+  const initialFramesToLoad = 24;
   const lenisRef = useRef<Lenis | null>(null);
   const sequenceContainerRef = useRef<HTMLDivElement | null>(null);
 
