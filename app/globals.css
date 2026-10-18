@@ -18,3 +18,11 @@ body {
   font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
   overflow-x: hidden;
 }
+
+/* Hide Next.js dev indicator badge ('N' logo) */
+nextjs-portal,
+#nextjs-dev-tools-root,
+[data-nextjs-dev-tools],
+[data-nextjs-toast] {
+  display: none !important;
+}

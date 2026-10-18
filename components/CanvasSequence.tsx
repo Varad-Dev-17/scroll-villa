@@ -495,8 +495,8 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
         </div>
       )}
 
-      {/* Background Cache Floating Pill Badge (Unobtrusive & Elegant) */}
-      {isInitialReady && totalLoadedCount < totalFrames && (
+      {/* Background Cache Floating Pill Badge (Commented out) */}
+      {/* {isInitialReady && totalLoadedCount < totalFrames && (
         <div className="absolute bottom-4 right-4 z-30 pointer-events-none transition-opacity duration-500">
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 text-[10px] font-mono tracking-wider">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -505,7 +505,7 @@ export const CanvasSequence: React.FC<CanvasSequenceProps> = ({
             </span>
           </div>
         </div>
-      )}
+      )} */}
     </div>
   );
 };

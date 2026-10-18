@@ -220,8 +220,8 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Sequence Scrubber HUD Bar (Fades out when leaving sequence) */}
-      <footer
+      {/* Sequence Scrubber HUD Bar (Commented out) */}
+      {/* <footer
         className={`fixed bottom-0 left-0 right-0 z-40 px-6 md:px-12 py-5 bg-gradient-to-t from-black/90 via-black/50 to-transparent backdrop-blur-[2px] transition-all duration-500 ease-out ${
           isInSequence ? 'opacity-100 pointer-events-auto translate-y-0' : 'opacity-0 pointer-events-none translate-y-6'
         }`}
@@ -254,7 +254,7 @@ export default function Home() {
             <span>Scroll To Continue</span>
           </div>
         </div>
-      </footer>
+      </footer> */}
 
       {/* ========================================================================= */}
       {/* 2. SECTION 01: ARCHITECTURAL VISION (From Screenshot 1) */}
